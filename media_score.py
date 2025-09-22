@@ -6,7 +6,8 @@ MEDIA_SCORES = {
     "조선일보": 0.6,
     "한겨레": 0.8,
     "중앙일보": 0.7,
-    "기타": 0.5
+    "기타": 0.5,
+    "마이너스" : -0.1
 }
 
 def get_media_score(media_name: str) -> float:
