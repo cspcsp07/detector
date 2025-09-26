@@ -1,8 +1,8 @@
 # main.py
 
-from method1_media_score import run_method1
-from method2_ml_model import run_method2
-from method3_ml_model import run_method3
+from media_score import run_method1
+from ml_model_1 import run_method2
+from ml_model_2 import run_method3
 from utils import ensemble
 
 def main():
