@@ -1,130 +1,156 @@
 import pandas as pd
 import numpy as np
+import os
+import glob
+from datetime import datetime
 
 # --- 튜닝 가능한 설정 값 ---
-# 1. 라벨별 신뢰도 기여 점수 (사용자 정의)
 LABEL_SCORE_MAP = {
-    0: 1.0,   # 사실
-    1: 0.6,   # 분석
-    2: -0.15, # 의견
-    3: -0.85  # 미확인
+    0: 1.0, 1: 0.6, 2: -0.15, 3: -0.85
 }
-
-# 2. 언론사 초기 신뢰도 가중치 (사전 지식)
-INITIAL_SOURCE_WEIGHTS = {
-    "MBC": 0.61,
-    "JTBC": 0.59,
-    "YTN": 0.55,
-    "SBS": 0.54,
-    "연합뉴스TV": 0.52,
-    "KBS": 0.48,
-    "MBN": 0.46,
-    "한겨레": 0.45,
-    "경향신문": 0.43,
-    "TV조선": 0.42,
-    "조선일보": 0.40,
-    "중앙일보": 0.40,
-    "동아일보": 0.39,
-    "한국일보": 0.32,
-    "오마이뉴스": 0.20,
-    "채널A": 0.20,
-    "문화일보": 0.12,
-    "뉴데일리": 0.13,
-    "지역신문": 0.39,
-    "etc": 0.20  # 신뢰도 정보 미공개 매체의 기본값 (중간값)
-}
-
-# 3. 초기 가중치 신뢰도 (Alpha)
 ALPHA = 0.7
-
-# 4. 통계적 유의성을 위한 최소 기사 수
 MIN_ARTICLES_SOURCE = 3
 MIN_ARTICLES_AUTHOR = 3
 
-# 5. 라벨링된 데이터 파일
-INPUT_CSV = "comprehensive_test_data.csv"
+# --- 파일 경로 설정 ---
+# 초기 가중치 파일 (스크립트와 같은 위치에 있다고 가정)
+INITIAL_WEIGHTS_FILE = "source_initial_weights.csv" 
+# 피드백 데이터를 저장하고 읽어올 폴더
+FEEDBACK_FOLDER = "feedback_data"
+# 업데이트된 가중치들을 저장할 폴더
+WEIGHTS_FOLDER = "weights_history" 
 
 
-def calculate_ultimate_weights(df: pd.DataFrame):
-    """'라벨 점수제'와 '기자 가중 평균'을 모두 적용하여 최종 가중치를 계산합니다."""
-    
-    df_clean = df.dropna(subset=['label', 'author'])
-    df_clean = df_clean[df_clean['label'].isin([0, 1, 2, 3])]
-    df_clean['label'] = pd.to_numeric(df_clean['label'])
+class CredibilityModel:
+    def __init__(self, initial_weights_csv_path):
+        """모델을 초기화합니다."""
+        
+        weight_files = glob.glob(os.path.join(WEIGHTS_FOLDER, 'weights_*.csv'))
+        
+        load_path = initial_weights_csv_path
+        if weight_files:
+            latest_file = max(weight_files, key=os.path.getctime)
+            if os.path.exists(latest_file):
+                load_path = latest_file
 
-    # --- 1단계: 모든 기사의 개별 점수(lk) 계산 ---
-    df_clean['article_score'] = df_clean['label'].map(LABEL_SCORE_MAP)
+        print(f"[INFO] 가중치 파일 로드: '{load_path}'")
+        try:
+            self.source_weights = pd.read_csv(load_path).set_index('source')
+            if 'final_weight' not in self.source_weights.columns:
+                self.source_weights['final_weight'] = self.source_weights['initial_weight']
+        except FileNotFoundError:
+            print(f"[ERROR] 가중치 파일을 찾을 수 없습니다: '{load_path}'")
+            self.source_weights = pd.DataFrame()
+            
+        self.author_weights = pd.DataFrame()
 
-    # --- 2단계: 기자 신뢰도 계산 (이는 기사 가중치 'wk'가 됨) ---
-    author_scores = df_clean.groupby('author').agg(
-        article_count=('label', 'count'),
-        avg_article_score=('article_score', 'mean')
-    ).reset_index()
-    author_scores = author_scores[author_scores['article_count'] >= MIN_ARTICLES_AUTHOR]
-    
-    # 기자 점수(-1 ~ +1)를 가중치로 사용하기 위해 0~1 범위로 정규화
-    author_scores['credibility_score'] = (author_scores['avg_article_score'] + 1) / 2
-    
-    # 기자 점수를 딕셔너리로 변환하여 나중에 쉽게 찾아 쓸 수 있도록 함
-    author_cred_dict = author_scores['credibility_score'].to_dict()
+    def update_with_feedback(self, feedback_data: pd.DataFrame):
+        """새로운 라벨링 데이터를 피드백받아 기존 가중치를 업데이트합니다."""
+        print("\n[INFO] 새로운 피드백 데이터로 가중치 업데이트를 시작합니다...")
+        
+        df_clean = feedback_data.dropna(subset=['label', 'author', 'source'])
+        df_clean = df_clean[df_clean['label'].isin([0, 1, 2, 3])]
+        df_clean['label'] = pd.to_numeric(df_clean['label'])
+        df_clean['article_score'] = df_clean['label'].map(LABEL_SCORE_MAP)
 
-    # --- 3단계: 기자 점수를 'wk'로 사용하여 언론사 가중 평균 계산 ---
-    # 원본 데이터에 기자별 신뢰도 점수(기사 가중치 'wk')를 추가
-    df_clean['author_cred_weight'] = df_clean['author'].map(author_cred_dict)
-    # 점수가 없는 기자(기사 수가 적어 필터링된)는 중립 가중치 0.5로 설정
-    df_clean['author_cred_weight'] = df_clean['author_cred_weight'].fillna(0.5)
+        author_scores = df_clean.groupby('author').agg(
+            article_count=('label', 'count'),
+            avg_article_score=('article_score', 'mean')
+        ).reset_index()
+        author_scores['credibility_score'] = (author_scores['avg_article_score'] + 1) / 2
+        self.author_weights = author_scores[author_scores['article_count'] >= MIN_ARTICLES_AUTHOR]
+        print("[INFO] 기자 신뢰도 업데이트 완료.")
 
-    # 가중 평균 공식을 계산하는 사용자 정의 함수
-    def weighted_average(group):
-        weights = group['author_cred_weight']  # wk
-        values = group['article_score']       # lk
-        return (weights * values).sum() / weights.sum()
+        df_current_weights = self.source_weights[['final_weight']].reset_index()
+        df_current_weights.rename(columns={'final_weight': 'initial_weight'}, inplace=True)
 
-    # 언론사별로 그룹화하여, 기사 수와 '가중 평균된 점수'를 계산
-    source_scores = df_clean.groupby('source').agg(
-        article_count=('label', 'count'),
-        weighted_avg_score=('article_score', lambda x: weighted_average(df_clean.loc[x.index]))
-    ).reset_index()
+        source_scores = df_clean.groupby('source').agg(
+            article_count=('label', 'count'),
+            avg_article_score=('article_score', 'mean')
+        ).reset_index()
+        source_scores['observed_score'] = (source_scores['avg_article_score'] + 1) / 2
+        
+        df_merged = df_current_weights.merge(source_scores, on='source', how='outer')
+        
+        etc_weight = df_current_weights[df_current_weights['source'] == 'etc']['initial_weight'].iloc[0] if 'etc' in df_current_weights['source'].values else 0.5
+        df_merged['initial_weight'] = df_merged['initial_weight'].fillna(etc_weight)
+        
+        df_merged['article_count'] = df_merged['article_count'].fillna(0).astype(int)
+        
+        fill_values = df_merged.set_index('source')['initial_weight'].to_dict()
+        df_merged['observed_score'] = df_merged['observed_score'].fillna(df_merged['source'].map(fill_values))
+        
+        df_merged['final_weight'] = np.where(
+            df_merged['article_count'] >= MIN_ARTICLES_SOURCE,
+            (df_merged['initial_weight'] * ALPHA) + (df_merged['observed_score'] * (1 - ALPHA)),
+            df_merged['initial_weight']
+        )
+        
+        self.source_weights = df_merged.set_index('source')
+        print("[INFO] 언론사 신뢰도 업데이트 완료.")
 
-    # 계산된 점수(-1 ~ +1)를 0~1 범위의 observed_score로 정규화
-    source_scores['observed_score'] = (source_scores['weighted_avg_score'] + 1) / 2
-    
-    # --- 4단계: 초기 가중치와 결합 (기존과 동일) ---
-    df_initial = pd.DataFrame(INITIAL_SOURCE_WEIGHTS.items(), columns=['source', 'initial_weight'])
-    df_merged = pd.merge(df_initial, source_scores, on='source', how='outer')
-    df_merged['initial_weight'] = df_merged['initial_weight'].fillna(INITIAL_SOURCE_WEIGHTS['etc'])
-    df_merged['article_count'] = df_merged['article_count'].fillna(0).astype(int)
-    df_merged['observed_score'] = df_merged['observed_score'].fillna(df_merged['initial_weight'])
-    
-    df_merged['final_weight'] = np.where(
-        df_merged['article_count'] >= MIN_ARTICLES_SOURCE,
-        (df_merged['initial_weight'] * ALPHA) + (df_merged['observed_score'] * (1 - ALPHA)),
-        df_merged['initial_weight']
-    )
-    
-    source_final_sorted = df_merged.sort_values(by='final_weight', ascending=False)
-    author_final_sorted = author_scores[['author', 'article_count', 'credibility_score']].sort_values(by='credibility_score', ascending=False)
-    
-    return source_final_sorted, author_final_sorted
+    def get_rankings(self):
+        """현재 모델의 언론사 및 기자 랭킹을 반환합니다."""
+        cols_to_show = [col for col in ['initial_weight', 'final_weight', 'article_count'] if col in self.source_weights.columns]
+        source_ranking = self.source_weights[cols_to_show].sort_values(by='final_weight', ascending=False)
+        
+        if not self.author_weights.empty:
+            author_ranking = self.author_weights[['author', 'article_count', 'credibility_score']].sort_values(by='credibility_score', ascending=False)
+        else:
+            author_ranking = self.author_weights
+        
+        return source_ranking, author_ranking
+
+    def save_weights_to_csv(self):
+        """현재 가중치를 지정된 폴더에 버전 관리되는 CSV 파일로 저장합니다."""
+        os.makedirs(WEIGHTS_FOLDER, exist_ok=True)
+        
+        today_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+        output_filename = os.path.join(WEIGHTS_FOLDER, f'weights_{today_str}.csv')
+        
+        df_to_save = self.source_weights.copy()
+        
+        cols_to_save = [col for col in ['initial_weight', 'final_weight', 'article_count'] if col in df_to_save.columns]
+        df_to_save[cols_to_save].to_csv(output_filename, encoding='utf-8-sig')
+        print(f"\n[SUCCESS] 업데이트된 가중치를 '{output_filename}' 파일로 저장했습니다.")
+
 
 
 if __name__ == "__main__":
-    try:
-        df_labeled = pd.read_csv(INPUT_CSV)
-        source_ranking, author_ranking = calculate_ultimate_weights(df_labeled)
+    model = CredibilityModel(INITIAL_WEIGHTS_FILE)
 
-        print("--- 최종 언론사별 가중치 (DataFrame 형태) ---")
-        source_ranking_output = source_ranking[['source', 'initial_weight', 'observed_score', 'article_count', 'final_weight']]
-        print(source_ranking_output.to_string(index=False))
+    print("\n--- Phase 1: 초기 로드된 언론사 가중치 ---")
+    initial_source_ranking, _ = model.get_rankings()
+    print(initial_source_ranking)
+    
+    # --- 여기가 핵심 수정 사항입니다 ---
+    # 1. 피드백 폴더 안의 모든 CSV 파일을 찾습니다.
+    feedback_files = glob.glob(os.path.join(FEEDBACK_FOLDER, '*.csv'))
+    
+    # 2. 피드백 파일이 존재하는 경우에만 업데이트를 진행합니다.
+    if feedback_files:
+        # 3. 가장 최신 파일을 찾습니다.
+        latest_feedback_file = max(feedback_files, key=os.path.getctime)
+        print(f"\n[INFO] 최신 피드백 데이터 파일 '{latest_feedback_file}'을 사용하여 업데이트를 시작합니다.")
+        
+        try:
+            new_labeled_data = pd.read_csv(latest_feedback_file)
+            model.update_with_feedback(new_labeled_data)
 
-        print("\n\n--- 최종 기자별 가중치 (DataFrame 형태) ---")
-        print(author_ranking.to_string(index=False))
+            print("\n--- Phase 2: 업데이트 후 최종 언론사 가중치 ---")
+            final_source_ranking, final_author_ranking = model.get_rankings()
+            
+            print(final_source_ranking)
+            print("\n\n--- 최종 기자별 가중치 ---")
+            print(final_author_ranking)
 
-        source_weight_dict = source_ranking.set_index('source')['final_weight'].to_dict()
-        print("\n\n--- 최종 언론사 가중치 (Dictionary 형태) ---")
-        print(source_weight_dict)
+            model.save_weights_to_csv()
 
-    except FileNotFoundError:
-        print(f"[ERROR] '{INPUT_CSV}' 파일을 찾을 수 없습니다.")
-    except Exception as e:
-        print(f"오류가 발생했습니다: {e}")
+        except FileNotFoundError:
+            print(f"\n[ERROR] 피드백 데이터 파일 '{latest_feedback_file}'을 찾을 수 없습니다.")
+        except Exception as e:
+            print(f"피드백 데이터 처리 중 오류가 발생했습니다: {e}")
+            
+    else:
+        # 4. 피드백 파일이 없으면 업데이트를 건너뜁니다.
+        print(f"\n[INFO] 피드백 폴더 '{FEEDBACK_FOLDER}'에 학습할 데이터가 없어 업데이트를 건너뜁니다.")
